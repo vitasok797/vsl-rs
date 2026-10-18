@@ -1,0 +1,24 @@
+[package]
+name = "vsl-rs"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev-static]
+inherits = "dev"
+
+[profile.release-static]
+inherits = "release"
+
+[lints.clippy]
+pedantic = "warn"
+as_conversions = "warn"
+clone_on_ref_ptr = "warn"
+create_dir = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+str_to_string = "warn"
+# cargo = "warn"
+
+[dependencies]
+anyhow = "1.0.104"
+thiserror = "2.0.21"
