@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import colorama
+import inspect
 import locale
 import os
 import re
@@ -54,7 +56,7 @@ def get_os_specific_script_name(name: str) -> str:
     return name + ('.bat' if IS_WINDOWS else '.sh')
 
 
-class UnknownAction(Exception):
+class CommandParseError(Exception):
     pass
 
 
@@ -218,6 +220,7 @@ class BaseAction:
     PROMPT_SHORTCUT: str | None = None
     CLI_COMMAND: str | None = None
     DESC: str | None = None
+    ARGS: str | None = None
 
     def __init__(self) -> None:
         self.manager = None
@@ -263,22 +266,25 @@ class InteractiveActionManager(BaseActionManager):
 
     def _process_user_command(self) -> None:
         print(self._generate_prompt(), end='', flush=True)
-        user_input = input()
+
+        user_input = input().strip()
+        if not user_input:
+            return
 
         try:
-            actions = self._get_actions_to_execute(user_input)
-        except UnknownAction as ex:
-            print_err(f'Unknown action "{ex}"')
+            actions = self._parse_command(user_input)
+        except CommandParseError as ex:
+            print_err(str(ex))
             print_err('--- ERROR ---')
             return
 
         is_multiple_actions = len(actions) > 1
-        for action in actions:
+        for action, args in actions:
             if is_multiple_actions:
                 print(f'--- {action.DESC} ---')
 
             try:
-                action.execute()
+                action.execute(**args)
 
             except ActionError as ex:  # noqa: PERF203
                 error_message = str(ex)
@@ -298,15 +304,75 @@ class InteractiveActionManager(BaseActionManager):
     def _generate_prompt(self) -> str:
         return colored(f'\n{self.active_profile}> ', Color.GREEN)
 
-    def _get_actions_to_execute(self, user_input: str) -> list[BaseAction]:
-        tokens = user_input.strip().split()
-        return [self._get_action_by_shortcut(token) for token in tokens]
+    def _parse_command(self, user_input: str) -> list[tuple]:
+        result = []
+
+        action_re = re.compile(r'\s*([^\s\(\)]+)(?:\((.*?)\))?\s*(?:\s|$)')
+
+        pos = 0
+        end_pos = len(user_input)
+        while pos < end_pos:
+            match = action_re.match(user_input, pos)
+
+            if not match:
+                raise CommandParseError('Unable to parse command')
+
+            action_name = match.group(1)
+            args_str = match.group(2) or ''
+
+            action = self._get_action_by_shortcut(action_name)
+            args = self._parse_arguments(args_str)
+
+            try:
+                sig = inspect.signature(action.execute)
+                sig.bind(**args)
+            except TypeError as ex:
+                raise CommandParseError(f'Wrong "{action_name}" action arguments ({ex})')
+
+            result.append((action, args))
+
+            pos = match.end()
+
+        return result
 
     def _get_action_by_shortcut(self, shortcut: str) -> BaseAction:
         for action in self.actions:
             if shortcut == action.PROMPT_SHORTCUT:
                 return action
-        raise UnknownAction(shortcut)
+        raise CommandParseError(f'Unknown action "{shortcut}"')
+
+    def _parse_arguments(self, args_str: str) -> dict:
+        args_str = args_str.strip()
+        if not args_str:
+            return {}
+
+        try:
+            wrapper_code = f'stub_function({args_str})'
+            tree = ast.parse(wrapper_code, mode='eval')
+
+            if not isinstance(tree.body, ast.Call):
+                raise Exception
+
+            # Check for positional args
+            if tree.body.args:
+                raise Exception
+
+            result = {}
+            for keyword in tree.body.keywords:
+                # Check for **{...} syntax
+                if keyword.arg is None:
+                    raise Exception
+
+                if keyword.arg in result:
+                    raise Exception
+
+                val_str = ast.unparse(keyword.value)
+                result[keyword.arg] = ast.literal_eval(val_str)
+
+            return result
+
+        except Exception:
+            raise CommandParseError(f'Failed to parse "{args_str}" expression')
 
 
 class CliActionManager(BaseActionManager):
@@ -343,15 +409,6 @@ class CliActionManager(BaseActionManager):
         self._options.func(**options)
 
 
-class ProfileArg:
-    def _cli_add_args(self, subparser: argparse.ArgumentParser) -> None:
-        subparser.add_argument(
-                '--profile',
-                type=str,
-                required=False,
-                )
-
-
 class ProfileSelectAction(BaseAction):
     PROMPT_SHORTCUT = 'p'
     DESC = 'Profile select'
@@ -372,50 +429,58 @@ class ProfileSelectAction(BaseAction):
             return profile
 
 
-def get_build_env_for_profile(profile: str) -> Mapping[str, str]:
+def get_build_env(profile: str) -> Mapping[str, str]:
     env = os.environ.copy()
     if profile.endswith('-static'):
         env['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS'] = '-C target-feature=+crt-static'
     return env
 
 
-class BuildAction(ProfileArg, BaseAction):
+class BuildAction(BaseAction):
     PROMPT_SHORTCUT = 'b'
     CLI_COMMAND = 'build'
     DESC = 'Build'
 
-    def execute(self, profile: str | None = None) -> None:
-        print('Building...')
+    def _cli_add_args(self, subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument('--profile', type=str, required=False)
 
+    def execute(
+            self,
+            profile: str | None = None,
+            ) -> None:
         profile = profile or self.manager.active_profile
-
         command = f'cargo build --profile {profile} --all-targets'
-        env = get_build_env_for_profile(profile)
 
+        print(f'Building ({profile})...')
         Console.run_shell_command(
                 command=command,
                 cwd=ROOT_DIR,
-                env=env,
+                env=get_build_env(profile),
                 error_exception=ActionError,
                 )
 
 
-class RebuildAction(ProfileArg, BaseAction):
+class RebuildAction(BaseAction):
     PROMPT_SHORTCUT = 'rb'
     CLI_COMMAND = 'rebuild'
     DESC = 'Rebuild'
 
-    def execute(self, profile: str | None = None) -> None:
+    def _cli_add_args(self, subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument('--profile', type=str, required=False)
+
+    def execute(
+            self,
+            profile: str | None = None,
+            ) -> None:
         profile = profile or self.manager.active_profile
 
         self._clean_profile(profile)
         BuildAction().execute(profile)
 
     def _clean_profile(self, profile: str) -> None:
-        print('Cleaning up profile...')
-
         command = f'cargo clean --profile {profile}'
 
+        print(f'Cleaning up ({profile})...')
         Console.run_shell_command(
                 command=command,
                 cwd=ROOT_DIR,
@@ -425,34 +490,63 @@ class RebuildAction(ProfileArg, BaseAction):
 
 class RunAction(BaseAction):
     PROMPT_SHORTCUT = 'r'
+    CLI_COMMAND = 'run'
     DESC = 'Run executable'
+    ARGS = f'{PROMPT_SHORTCUT}, {PROMPT_SHORTCUT}(bin=\'name\'), {PROMPT_SHORTCUT}(example=\'name\')'
 
-    def execute(self) -> None:
-        print('Executing...')
+    def _cli_add_args(self, subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument('--profile', type=str, required=False)
+        subparser.add_argument('--bin', type=str, required=False)
+        subparser.add_argument('--example', type=str, required=False)
 
-        profile = self.manager.active_profile
+    def execute(
+            self,
+            profile: str | None = None,
+            bin: str | None = None,
+            example: str | None = None,
+            ) -> None:
+        if bin and example:
+            raise ActionError('Only one of the following arguments (bin, example) can be provided')
 
+        profile = profile or self.manager.active_profile
         command = f'cargo run --profile {profile}'
-        env = get_build_env_for_profile(profile)
+        desc = ''
 
+        if bin:
+            command += f' --bin "{bin}"'
+            desc = f' binary "{bin}"'
+        if example:
+            command += f' --example "{example}"'
+            desc = f' example "{example}"'
+
+        print(f'Executing{desc} ({profile})...')
         Console.run_shell_command(
                 command=command,
                 cwd=ROOT_DIR,
-                env=env,
+                env=get_build_env(profile),
                 error_exception=ActionError,
                 )
 
 
 class RunTestsAction(BaseAction):
     PROMPT_SHORTCUT = 't'
-    CLI_COMMAND = 'tests'
+    CLI_COMMAND = 'test'
     DESC = 'Run tests'
+    ARGS = f'{PROMPT_SHORTCUT}, {PROMPT_SHORTCUT}(test=\'name_pattern\')'
 
-    def execute(self) -> None:
-        print('Executing tests...')
+    def _cli_add_args(self, subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument('--test', type=str, required=False)
 
+    def execute(
+            self,
+            test: str | None = None,
+            ) -> None:
         command = 'cargo test'
 
+        if test:
+            command += f' {test}'
+
+        print('Executing tests...')
         Console.run_shell_command(
                 command=command,
                 cwd=ROOT_DIR,
@@ -463,13 +557,12 @@ class RunTestsAction(BaseAction):
 class CleanAction(BaseAction):
     PROMPT_SHORTCUT = 'cl'
     CLI_COMMAND = 'clean'
-    DESC = 'Clean generated artifacts'
+    DESC = 'Clean generated artifacts (all profiles)'
 
     def execute(self) -> None:
-        print('Cleaning up...')
-
         command = 'cargo clean'
 
+        print('Cleaning up (all)...')
         Console.run_shell_command(
                 command=command,
                 cwd=ROOT_DIR,
@@ -514,11 +607,12 @@ class DepsExportAction(BaseAction):
         if not Path(dest_dir).is_dir():
             raise ActionError(f'Destination dir "{dest_dir}" not found')
 
+        command = 'cargo fetch'
+
         env = os.environ.copy()
         env['CARGO_HOME'] = dest_dir
 
-        print('Export dependencies...\n')
-        command = 'cargo fetch'
+        print('Exporting dependencies...\n')
         Console.run_shell_command(
                 command=command,
                 cwd=ROOT_DIR,
@@ -533,10 +627,9 @@ class FormatAction(BaseAction):
     DESC = 'Format'
 
     def execute(self) -> None:
-        print('Formatting...')
-
         command = 'cargo fmt'
 
+        print('Formatting...')
         Console.run_shell_command(
                 command=command,
                 cwd=ROOT_DIR,
@@ -546,7 +639,7 @@ class FormatAction(BaseAction):
 
 class OpenExplorerAction(BaseAction):
     PROMPT_SHORTCUT = 'expl'
-    DESC = 'Open Windows explorer'
+    DESC = 'Open Windows Explorer'
 
     def is_active(self) -> bool:
         return IS_WINDOWS
@@ -563,7 +656,7 @@ class OpenTerminalAction(BaseAction):
         return IS_WINDOWS
 
     def execute(self) -> None:
-        subprocess.Popen("cmd.exe /K", cwd=ROOT_DIR, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        subprocess.Popen('cmd.exe /K', cwd=ROOT_DIR, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
 
 class ClsAction(BaseAction):
@@ -588,7 +681,10 @@ class HelpAction(BaseAction):
 
     def execute(self) -> None:
         for action in self.manager.actions:
-            print(f'  {action.PROMPT_SHORTCUT}\t{action.DESC}')
+            action_help = f'  {action.PROMPT_SHORTCUT}\t{action.DESC}'
+            if action.ARGS:
+                action_help += f': {action.ARGS}'
+            print(action_help)
 
 
 def start_interactive_mode() -> None:
